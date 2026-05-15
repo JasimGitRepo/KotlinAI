@@ -22,17 +22,19 @@ android {
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
+    
+    // LiteRT-LM requires Java 21 (Class file version 65.0)
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
+        sourceCompatibility = JavaVersion.VERSION_21
+        targetCompatibility = JavaVersion.VERSION_21
     }
     kotlinOptions {
-        jvmTarget = "17"
+        jvmTarget = "21"
     }
+    
     buildFeatures {
         compose = true
     }
-    
 
     packaging {
         resources {
@@ -64,6 +66,6 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     
-    // LiteRT-LM
-    implementation("com.google.ai.edge.litertlm:litertlm-android:1.0.0") // Replaced latest.release with stable for deterministic builds
+    // Official Google LiteRT-LM dependency (Latest Stable)
+    implementation("com.google.ai.edge.litertlm:litertlm-android:0.11.0") 
 }
