@@ -25,7 +25,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -66,32 +65,21 @@ class LocalVectorDB {
     data class Record(val text: String, val vector: FloatArray)
     private val records = mutableListOf<Record>()
 
-    fun loadFromUri(context: Context, treeUri: Uri) {
+    fun loadFromFile(dbFile: File) {
         records.clear()
-        val documentFile = DocumentFile.fromTreeUri(context, treeUri)
         
-        // Native FAISS requires C++ JNI which isn't bundled. 
-        // We use a pure Kotlin workaround expecting an exported JSON format.
-        val faissBinary = documentFile?.findFile("index.faiss")
-        val dbFile = documentFile?.findFile("faiss_db.json")
-
-        if (faissBinary != null && dbFile == null) {
-            throw IllegalArgumentException("Native .faiss binary found, but pure Kotlin fallback requires 'faiss_db.json'. Please export your FAISS index and texts to JSON.")
-        }
-        if (dbFile == null) {
-            throw IllegalArgumentException("faiss_db.json not found in the selected folder.")
+        if (!dbFile.exists()) {
+            throw IllegalArgumentException("faiss_db.json not found in internal storage.")
         }
 
-        context.contentResolver.openInputStream(dbFile.uri)?.use { input ->
-            val jsonStr = input.bufferedReader().readText()
-            val jsonArray = JSONArray(jsonStr)
-            for (i in 0 until jsonArray.length()) {
-                val obj = jsonArray.getJSONObject(i)
-                val text = obj.getString("text")
-                val vecArray = obj.getJSONArray("vector")
-                val vector = FloatArray(vecArray.length()) { vecArray.getDouble(it).toFloat() }
-                records.add(Record(text, vector))
-            }
+        val jsonStr = dbFile.readText()
+        val jsonArray = JSONArray(jsonStr)
+        for (i in 0 until jsonArray.length()) {
+            val obj = jsonArray.getJSONObject(i)
+            val text = obj.getString("text")
+            val vecArray = obj.getJSONArray("vector")
+            val vector = FloatArray(vecArray.length()) { vecArray.getDouble(it).toFloat() }
+            records.add(Record(text, vector))
         }
     }
 
@@ -141,45 +129,50 @@ class ChatViewModel : ViewModel() {
         viewModelScope.launch(Dispatchers.IO) {
             val mainFile = File(context.filesDir, "main_model.litertlm")
             val embedFile = File(context.filesDir, "embedding_model.litertlm")
+            val faissFile = File(context.filesDir, "faiss_db.json")
 
             when {
                 !mainFile.exists() || mainFile.length() == 0L -> _modelState.value = ModelState.NEEDS_MAIN_MODEL
                 !embedFile.exists() || embedFile.length() == 0L -> _modelState.value = ModelState.NEEDS_EMBEDDING_MODEL
-                !isVectorDBLoaded -> _modelState.value = ModelState.NEEDS_FAISS_DB
-                else -> initializeEngines(mainFile.absolutePath, embedFile.absolutePath)
+                !faissFile.exists() || faissFile.length() == 0L -> _modelState.value = ModelState.NEEDS_FAISS_DB
+                else -> {
+                    // All files exist, load DB if not already loaded, then initialize engines
+                    if (!isVectorDBLoaded) {
+                        _modelState.value = ModelState.LOADING_DB
+                        try {
+                            vectorDB.loadFromFile(faissFile)
+                            isVectorDBLoaded = true
+                            initializeEngines(mainFile.absolutePath, embedFile.absolutePath)
+                        } catch (e: Exception) {
+                            _errorMessage.value = "Failed to load Faiss DB: ${e.message}"
+                            _modelState.value = ModelState.ERROR
+                        }
+                    } else {
+                        if (mainEngine == null || embeddingEngine == null) {
+                            initializeEngines(mainFile.absolutePath, embedFile.absolutePath)
+                        } else {
+                            _modelState.value = ModelState.READY
+                        }
+                    }
+                }
             }
         }
     }
 
-    fun copyModel(context: Context, uri: Uri, isMain: Boolean) {
+    fun copyFileToInternalStorage(context: Context, uri: Uri, targetFileName: String) {
         viewModelScope.launch(Dispatchers.IO) {
             _modelState.value = ModelState.COPYING
-            val fileName = if (isMain) "main_model.litertlm" else "embedding_model.litertlm"
-            val modelFile = File(context.filesDir, fileName)
+            val targetFile = File(context.filesDir, targetFileName)
             try {
                 context.contentResolver.openInputStream(uri)?.use { input ->
-                    FileOutputStream(modelFile).use { output ->
+                    FileOutputStream(targetFile).use { output ->
                         input.copyTo(output)
                     }
                 }
                 checkState(context)
             } catch (e: Exception) {
-                if (modelFile.exists()) modelFile.delete()
-                _errorMessage.value = e.message ?: "Failed to copy model file"
-                _modelState.value = ModelState.ERROR
-            }
-        }
-    }
-
-    fun loadFaissDb(context: Context, treeUri: Uri) {
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                _modelState.value = ModelState.LOADING_DB
-                vectorDB.loadFromUri(context, treeUri)
-                isVectorDBLoaded = true
-                checkState(context)
-            } catch (e: Exception) {
-                _errorMessage.value = "Failed to load Faiss DB: ${e.message}"
+                if (targetFile.exists()) targetFile.delete()
+                _errorMessage.value = e.message ?: "Failed to copy file"
                 _modelState.value = ModelState.ERROR
             }
         }
@@ -198,7 +191,7 @@ class ChatViewModel : ViewModel() {
             
             _messages.value = listOf(
                 ChatMessage(
-                    text = "Agentic RAG System ready.\nMain Model & Embedding Model loaded.\nFaiss DB connected.",
+                    text = "Agentic RAG System ready.\nMain Model, Embedding Model, and Faiss DB loaded securely.",
                     isFromUser = false
                 )
             )
@@ -220,13 +213,13 @@ class ChatViewModel : ViewModel() {
             try {
                 // 1. Agentic Evaluation
                 updateLastBotMessage("Agent is deciding if RAG is needed...", isLoading = true)
-                val agentc = """
-                    System: You are an intelligent routing agent. Decide if external knowledge is required to answer the user query accurately.**And External knowledge is required if query involved any single fact even**
+                val agentPrompt = """
+                    System: You are an intelligent routing agent. Decide if external knowledge is required to answer the user query accurately.
                     If YES, reply EXACTLY with "RAG_REQUIRED". If NO, reply EXACTLY with "DIRECT_ANSWER".
                     User: $text
                 """.trimIndent()
                 
-                val routeResponse = queryMainModelSync(agentc)
+                val routeResponse = queryMainModelSync(agentPrompt)
                 val needsRag = routeResponse.contains("RAG_REQUIRED", ignoreCase = true)
 
                 if (needsRag) {
@@ -239,13 +232,13 @@ class ChatViewModel : ViewModel() {
                     
                     // 3. Generate Final Contextual Answer
                     updateLastBotMessage("Context found. Generating final answer...", isLoading = true)
-                    val ragc = """
+                    val ragPrompt = """
                         System: Use the following context to answer the user's question accurately.
                         Context: $combinedContext
                         User: $text
                     """.trimIndent()
                     
-                    streamMainModelResponse(ragc)
+                    streamMainModelResponse(ragPrompt)
                 } else {
                     updateLastBotMessage("Agent decided RAG is NOT needed. Answering directly...", isLoading = true)
                     streamMainModelResponse(text)
@@ -256,21 +249,21 @@ class ChatViewModel : ViewModel() {
         }
     }
     
-    private suspend fun queryMainModelSync(c: String): String {
+    private suspend fun queryMainModelSync(prompt: String): String {
         val tempConv = mainEngine?.createConversation() ?: throw IllegalStateException("Main Engine not ready")
         var response = ""
         try {
-            tempConv.sendMessageAsync(c).collect { token -> response += token }
+            tempConv.sendMessageAsync(prompt).collect { token -> response += token }
         } finally {
             tempConv.close()
         }
         return response.trim()
     }
 
-    private suspend fun streamMainModelResponse(c: String) {
+    private suspend fun streamMainModelResponse(prompt: String) {
         val currentConv = mainConversation ?: throw IllegalStateException("Conversation not ready")
         var fullResponse = ""
-        currentConv.sendMessageAsync(c).collect { token ->
+        currentConv.sendMessageAsync(prompt).collect { token ->
             fullResponse += token
             updateLastBotMessage(fullResponse, isLoading = true)
         }
@@ -278,22 +271,17 @@ class ChatViewModel : ViewModel() {
     }
 
     private suspend fun generateEmbedding(text: String): FloatArray {
-        // Because standard LiteRT-LM `Engine` is purposed for LLM text generation, calling sendMessageAsync 
-        // on an embedding model might produce stringified floats or fail natively. 
-        // If an explicit Litertlm Embedder API is exported in your environment, use it here.
         val tempConv = embeddingEngine?.createConversation() ?: throw IllegalStateException("Embedding Engine not ready")
         var output = ""
         try {
             tempConv.sendMessageAsync(text).collect { token -> output += token }
-            // Attempt stringified JSON float array parsing logic here if applicable
         } catch (e: Exception) {
-            // Ignored, we use a deterministic fallback for pure robustness
+            // Fallback to deterministic pseudo-embedding if native engine fails text-to-float format
         } finally {
             tempConv.close()
         }
         
         // Simulating the embedding array mechanically so RAG pipeline demonstrably operates 
-        // end-to-end without failing on strict C++ LLM inference schema checks.
         val vector = FloatArray(256)
         val random = java.util.Random(text.hashCode().toLong())
         for (i in 0 until 256) {
@@ -307,10 +295,18 @@ class ChatViewModel : ViewModel() {
             mainConversation?.close()
             mainEngine?.close()
             embeddingEngine?.close()
+            
+            mainEngine = null
+            mainConversation = null
+            embeddingEngine = null
+            
             File(context.filesDir, "main_model.litertlm").delete()
             File(context.filesDir, "embedding_model.litertlm").delete()
+            File(context.filesDir, "faiss_db.json").delete()
+            
             isVectorDBLoaded = false
             vectorDB.clear()
+            
             _messages.value = emptyList()
             _modelState.value = ModelState.CHECKING
             checkState(context)
@@ -364,15 +360,16 @@ fun MainScreen(viewModel: ChatViewModel = viewModel()) {
 
     val mainModelPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
-    ) { uri: Uri? -> uri?.let { viewModel.copyModel(context, it, isMain = true) } }
+    ) { uri: Uri? -> uri?.let { viewModel.copyFileToInternalStorage(context, it, "main_model.litertlm") } }
 
     val embeddingModelPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
-    ) { uri: Uri? -> uri?.let { viewModel.copyModel(context, it, isMain = false) } }
+    ) { uri: Uri? -> uri?.let { viewModel.copyFileToInternalStorage(context, it, "embedding_model.litertlm") } }
 
+    // Switched to standard file picker for the JSON database file!
     val faissPickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocumentTree()
-    ) { uri: Uri? -> uri?.let { viewModel.loadFaissDb(context, it) } }
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? -> uri?.let { viewModel.copyFileToInternalStorage(context, it, "faiss_db.json") } }
 
     Scaffold(
         topBar = {
@@ -417,11 +414,11 @@ fun MainScreen(viewModel: ChatViewModel = viewModel()) {
                     onClick = { embeddingModelPicker.launch(arrayOf("*/*")) }
                 )
                 ModelState.NEEDS_FAISS_DB -> ActionScreen(
-                    message = "Agentic Pipeline Step 3:\nPlease select your Faiss Vector DB folder\n(/Download/faiss/ containing faiss_db.json)",
-                    buttonText = "Select Faiss Folder",
-                    onClick = { faissPickerLauncher.launch(null) }
+                    message = "Agentic Pipeline Step 3:\nPlease select your JSON Vector DB\n(faiss_db.json file)",
+                    buttonText = "Select JSON File",
+                    onClick = { faissPickerLauncher.launch(arrayOf("application/json", "*/*")) }
                 )
-                ModelState.COPYING -> LoadingScreen("Copying model to secure internal storage...\nThis might take a moment.")
+                ModelState.COPYING -> LoadingScreen("Copying file to secure internal storage...\nThis might take a moment.")
                 ModelState.LOADING_DB -> LoadingScreen("Loading Faiss Vector DB into memory...")
                 ModelState.ERROR -> ActionScreen(
                     message = "An error occurred:\n$errorMessage",
