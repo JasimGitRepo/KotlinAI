@@ -35,6 +35,12 @@ android {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
+        jniLibs {
+            useLegacyPackaging = true
+            keepDebugSymbols += "**/libLiteRt.so"
+            keepDebugSymbols += "**/libLiteRtClGlAccelerator.so"
+            keepDebugSymbols += "**/liblitertlm_jni.so"
+        }
     }
 }
 
